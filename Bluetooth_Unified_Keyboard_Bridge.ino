@@ -10,9 +10,10 @@
 // fast blinks mean keyboard detected, press a keyboard key to connect
 
 // === CONFIGURATION ===
-#define DEBUG_MODE true   // Set to false to reduce serial output
-#define BLINK_MODE true    // Set to false for solid LED (no keypress blinks)
+#define DEBUG_MODE false   // Set to false to reduce serial output
+#define BLINK_MODE false    // Set to false for solid LED (no keypress blinks)
 #define SCAN_MODE "BLE"   // Options: "BT_Classic", "BLE", "Both"
+#define ENABLE_KEY_REMAP 1
 
 // Include both Bluetooth stacks
 extern "C" {
@@ -22,6 +23,11 @@ extern "C" {
 #include <BluetoothHIDMaster.h>
 #include <Keyboard.h>
 #include <Mouse.h>
+#if ENABLE_KEY_REMAP
+#include "host.h"
+#include "timer.h"
+#include "action.h"
+#endif
 
 // Connection state management
 typedef enum {
@@ -68,6 +74,55 @@ unsigned long stateStartTime = 0;
 const unsigned long CLASSIC_SCAN_TIMEOUT = 10000; // 10 seconds
 const unsigned long BLE_SCAN_TIMEOUT = 15000;     // 15 seconds
 
+#if ENABLE_KEY_REMAP
+class MyKeyboard: public Keyboard_ {
+public:
+  MyKeyboard(): Keyboard_{}
+  {}
+
+  virtual void sendReport(KeyReport* keys) override
+  {
+    Keyboard_::sendReport(keys);
+  }
+};
+
+static MyKeyboard g_keyboard{};
+#define Keyboard g_keyboard
+
+static void send_keyboard(report_keyboard_t *report)
+{
+  g_keyboard.sendReport((KeyReport*)report);
+}
+
+class MyMouse: public Mouse_ {
+public:
+  MyMouse(): Mouse_{}
+  {}
+
+  void buttons(uint8_t b)
+  {
+    Mouse_::buttons(b);
+  }
+};
+
+static MyMouse g_mouse{};
+#define Mouse g_mouse
+
+static void send_mouse(report_mouse_t *report)
+{
+  g_mouse.buttons(report->buttons);
+  g_mouse.move(report->x, report->y, report->v);
+}
+
+static host_driver_t g_hostDriver = {
+  NULL,
+  &send_keyboard,
+  &send_mouse,
+  NULL,
+  NULL
+};
+#endif
+
 void setup() {
   Serial.begin(115200);
   delay(3000);
@@ -110,6 +165,10 @@ void setup() {
     stateStartTime = millis();
     initAndScanClassic();
   }
+
+#if ENABLE_KEY_REMAP
+  host_set_driver(&g_hostDriver);
+#endif
 }
 
 void initAndScanClassic() {
@@ -529,6 +588,43 @@ void forwardClassicToUSB(uint8_t modifiers, uint8_t *keys) {
   memcpy(last_keys, keys, 6);
 }
 
+#if ENABLE_KEY_REMAP
+/* KEY CODE to Matrix
+ *
+ * HID keycode(1 byte):
+ * Higher 5 bits indicates ROW and lower 3 bits COL.
+ *
+ *  7 6 5 4 3 2 1 0
+ * +---------------+
+ * |  ROW  |  COL  |
+ * +---------------+
+ *
+ * Matrix space(16 * 16):
+ *   r\c0123456789ABCDEF
+ *   0 +----------------+
+ *   : |                |
+ *   : |                |
+ *  16 +----------------+
+ *
+ * From: tmk_keyboard/converter/usb_usb/usb_usb.cpp
+ */
+#define ROW_MASK 0xF0
+#define COL_MASK 0x0F
+#define CODE(row, col)  (((row) << 4) | (col))
+#define ROW(code)       ((uint8_t)(((code) & ROW_MASK) >> 4))
+#define COL(code)       ((uint8_t)((code) & COL_MASK))
+void forwardBLEKeyToUSB(int key, bool state) {
+  if (key >= 256) return;
+
+  keyevent_t e = (keyevent_t){
+    .key = (keypos_t){.col = COL(key), .row = ROW(key) },
+    .pressed = state,
+    .time = (uint16_t)(timer_read() | 1) /* time should not be 0 */
+  };
+
+  action_exec(e);
+}
+#else
 void forwardBLEKeyToUSB(int key, bool state) {
   if (key >= 256) return;
   
@@ -553,6 +649,7 @@ void forwardBLEKeyToUSB(int key, bool state) {
     }
   }
 }
+#endif
 
 void celebrationBlinks(int count) {
   pairingBlinks = count;
