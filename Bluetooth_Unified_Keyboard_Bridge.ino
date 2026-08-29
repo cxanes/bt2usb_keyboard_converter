@@ -10,9 +10,9 @@
 // fast blinks mean keyboard detected, press a keyboard key to connect
 
 // === CONFIGURATION ===
-#define DEBUG_MODE false   // Set to false to reduce serial output
+#define DEBUG_MODE true   // Set to false to reduce serial output
 #define BLINK_MODE true    // Set to false for solid LED (no keypress blinks)
-#define SCAN_MODE "Both"   // Options: "BT_Classic", "BLE", "Both"
+#define SCAN_MODE "BLE"   // Options: "BT_Classic", "BLE", "Both"
 
 // Include both Bluetooth stacks
 extern "C" {
@@ -227,8 +227,8 @@ void initAndScanBLE() {
   Serial.println("BLE HID master started");
   
   // Start BLE connection attempt
-  ble_hid.connectBLE();
-  Serial.println("BLE connection initiated - waiting for device...");
+  bool connected = ble_hid.connectBLE();
+  Serial.printf("BLE connection initiated (%d) - waiting for device...", (int)connected);
   Serial.println("(BLE devices will be detected on first keypress)");
 }
 
