@@ -54,7 +54,7 @@ static btstack_packet_callback_registration_t hci_event_callback_registration;
 // BLE components
 BluetoothHIDMaster ble_hid;
 HIDKeyStream keystream;
-static const uint8_t* bleLastConnectedAddress = nullptr;
+static uint8_t bleLastConnectedAddress[6] = {};
 static uint8_t bleLastConnectedAddressType = 0;
 static unsigned long bleCheckConnectionTime = 0;
 
@@ -304,7 +304,7 @@ void initAndScanBLE() {
   Serial.printf("BLE connection initiated (%d) - waiting for device...", (int)connected);
   //Serial.println("(BLE devices will be detected on first keypress)");
 
-  bleLastConnectedAddress = ble_hid.lastConnectedAddress();
+  memcpy(bleLastConnectedAddress, ble_hid.lastConnectedAddress(), sizeof(bleLastConnectedAddress));
   bleLastConnectedAddressType = ble_hid.lastConnectedAddressType();
 }
 
@@ -700,9 +700,12 @@ void loop() {
 
 void reconnectBle()
 {
-  ble_hid.disconnect();
+  if (BOOTSEL) {
+    return;
+  }
+
   const bool connected = ble_hid.connectBLE(bleLastConnectedAddress, bleLastConnectedAddressType);
-  Serial.printf("Trying reconnect BLE (%d)...\n", (int)connected);
+  Serial.printf("Trying BLE reconnection (%d)...\n", (int)connected);
 }
 
 void handleStateTimeouts(unsigned long currentTime) {
