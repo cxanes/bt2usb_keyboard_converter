@@ -27,6 +27,7 @@ extern "C" {
 #include "host.h"
 #include "timer.h"
 #include "action.h"
+#include "my_hid_device.h"
 #endif
 
 // Connection state management
@@ -79,60 +80,36 @@ const unsigned long BLE_SCAN_TIMEOUT = 15000;     // 15 seconds
 const unsigned long BLE_CHECK_TIMEOUT = 5000;     // 5 seconds
 
 #if ENABLE_KEY_REMAP
-class MyKeyboard: public Keyboard_ {
-public:
-  MyKeyboard(): Keyboard_{}
-  {}
-
-  virtual void sendReport(KeyReport* keys) override
-  {
-    Keyboard_::sendReport(keys);
-  }
-
-  virtual void sendConsumerReport(uint16_t key) override
-  {
-    Keyboard_::sendConsumerReport(key);
-  }
-};
-
-static MyKeyboard g_keyboard{};
-#define Keyboard g_keyboard
+#define Keyboard MyKeyboard
 
 static void send_keyboard(report_keyboard_t *report)
 {
-  g_keyboard.sendReport((KeyReport*)report);
+  Keyboard.sendReport((KeyReport*)report);
 }
 
 static void send_consumer(uint16_t key)
 {
-  g_keyboard.sendConsumerReport(key);
+  Keyboard.sendConsumerReport(key);
 }
 
-class MyMouse: public Mouse_ {
-public:
-  MyMouse(): Mouse_{}
-  {}
+static void send_system(uint16_t key)
+{
+  Keyboard.sendSystemReport(key);
+}
 
-  void buttons(uint8_t b)
-  {
-    Mouse_::buttons(b);
-  }
-};
-
-static MyMouse g_mouse{};
-#define Mouse g_mouse
+#define Mouse MyMouse
 
 static void send_mouse(report_mouse_t *report)
 {
-  g_mouse.buttons(report->buttons);
-  g_mouse.move(report->x, report->y, report->v);
+  Mouse.buttons(report->buttons);
+  Mouse.move(report->x, report->y, report->v);
 }
 
 static host_driver_t g_hostDriver = {
   NULL,
   &send_keyboard,
   &send_mouse,
-  NULL,
+  &send_system,
   &send_consumer
 };
 #endif
