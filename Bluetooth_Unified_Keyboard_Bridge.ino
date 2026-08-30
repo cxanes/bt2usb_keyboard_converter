@@ -54,6 +54,9 @@ static btstack_packet_callback_registration_t hci_event_callback_registration;
 // BLE components
 BluetoothHIDMaster ble_hid;
 HIDKeyStream keystream;
+static const uint8_t* bleLastConnectedAddress = nullptr;
+static uint8_t bleLastConnectedAddressType = 0;
+static unsigned long bleCheckConnectionTime = 0;
 
 // Shared state tracking
 static uint8_t last_modifiers = 0;
@@ -73,6 +76,7 @@ unsigned long lastScan = 0;
 unsigned long stateStartTime = 0;
 const unsigned long CLASSIC_SCAN_TIMEOUT = 10000; // 10 seconds
 const unsigned long BLE_SCAN_TIMEOUT = 15000;     // 15 seconds
+const unsigned long BLE_CHECK_TIMEOUT = 5000;     // 5 seconds
 
 #if ENABLE_KEY_REMAP
 class MyKeyboard: public Keyboard_ {
@@ -286,9 +290,12 @@ void initAndScanBLE() {
   Serial.println("BLE HID master started");
   
   // Start BLE connection attempt
-  bool connected = ble_hid.connectBLE();
+  const bool connected = ble_hid.connectBLE();
   Serial.printf("BLE connection initiated (%d) - waiting for device...", (int)connected);
-  Serial.println("(BLE devices will be detected on first keypress)");
+  //Serial.println("(BLE devices will be detected on first keypress)");
+
+  bleLastConnectedAddress = ble_hid.lastConnectedAddress();
+  bleLastConnectedAddressType = ble_hid.lastConnectedAddressType();
 }
 
 void setupBLECallbacks() {
@@ -362,6 +369,7 @@ void handleBLEKey(int key, bool state) {
     connection_state = BLE_CONNECTED;
     celebrationBlinks(8); // 4 blinks for BLE
     
+    bleCheckConnectionTime = millis();
     // After celebration, LED will go solid (handled in LED patterns)
   }
   
@@ -680,6 +688,13 @@ void loop() {
   delay(10);
 }
 
+void reconnectBle()
+{
+  ble_hid.disconnect();
+  const bool connected = ble_hid.connectBLE(bleLastConnectedAddress, bleLastConnectedAddressType);
+  Serial.printf("Trying reconnect BLE (%d)...\n", (int)connected);
+}
+
 void handleStateTimeouts(unsigned long currentTime) {
   switch (connection_state) {
     case SCANNING_CLASSIC:
@@ -698,9 +713,18 @@ void handleStateTimeouts(unsigned long currentTime) {
     case SCANNING_BLE:
       if (currentTime - stateStartTime > BLE_SCAN_TIMEOUT) {
         if (strcmp(SCAN_MODE, "BLE") == 0) {
-          Serial.println("BLE scan timeout - BLE only mode, retrying...");
-          stateStartTime = currentTime;
-          initAndScanBLE(); // Retry BLE scan
+          if (ble_hid.connected()) {
+            Serial.printf("=== BLE DEVICE CONNECTED ===\n");
+            Serial.printf("Ready to forward BLE input to USB.\n");
+            Serial.printf("========================\n");
+            connection_state = BLE_CONNECTED;
+            celebrationBlinks(8); // 4 blinks for BLE
+            bleCheckConnectionTime = currentTime;
+          } else {
+            Serial.println("BLE scan timeout - BLE only mode, retrying...");
+            stateStartTime = currentTime;
+            initAndScanBLE(); // Retry BLE scan
+          }
         } else {
           Serial.println("BLE scan timeout - restarting from Classic");
           connection_state = BOTH_FAILED;
@@ -715,6 +739,15 @@ void handleStateTimeouts(unsigned long currentTime) {
         connection_state = SCANNING_CLASSIC;
         stateStartTime = currentTime;
         initAndScanClassic();
+      }
+      break;
+
+    case BLE_CONNECTED:
+      if (currentTime - bleCheckConnectionTime > BLE_CHECK_TIMEOUT) {
+        bleCheckConnectionTime = currentTime;
+        if (!ble_hid.connected()) {
+          reconnectBle();
+        }
       }
       break;
   }
