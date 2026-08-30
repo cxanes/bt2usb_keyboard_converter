@@ -88,6 +88,11 @@ public:
   {
     Keyboard_::sendReport(keys);
   }
+
+  virtual void sendConsumerReport(uint16_t key) override
+  {
+    Keyboard_::sendConsumerReport(key);
+  }
 };
 
 static MyKeyboard g_keyboard{};
@@ -96,6 +101,11 @@ static MyKeyboard g_keyboard{};
 static void send_keyboard(report_keyboard_t *report)
 {
   g_keyboard.sendReport((KeyReport*)report);
+}
+
+static void send_consumer(uint16_t key)
+{
+  g_keyboard.sendConsumerReport(key);
 }
 
 class MyMouse: public Mouse_ {
@@ -123,7 +133,7 @@ static host_driver_t g_hostDriver = {
   &send_keyboard,
   &send_mouse,
   NULL,
-  NULL
+  &send_consumer
 };
 #endif
 
