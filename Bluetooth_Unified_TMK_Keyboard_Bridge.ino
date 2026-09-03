@@ -262,20 +262,24 @@ void fallbackToBLE() {
 }
 
 void initAndScanBLE() {
-  Serial.println("Initializing BLE stack...");
-  
-  // Setup the HID key to ASCII conversion
-  keystream.begin();
-  Serial.println("KeyStream initialized");
+  static bool inited = false;
+  if (!inited) {
+    Serial.println("Initializing BLE stack...");
 
-  // Setup BLE callbacks
-  setupBLECallbacks();
-  Serial.println("BLE callbacks configured");
+    // Setup the HID key to ASCII conversion
+    keystream.begin();
+    Serial.println("KeyStream initialized");
 
-  // Start BLE HID master
-  ble_hid.begin(true);
-  Serial.println("BLE HID master started");
-  
+    // Setup BLE callbacks
+    setupBLECallbacks();
+    Serial.println("BLE callbacks configured");
+
+    // Start BLE HID master
+    ble_hid.begin(true);
+    Serial.println("BLE HID master started");
+    inited = true;
+  }
+
   // Start BLE connection attempt
   const bool connected = ble_hid.connectBLE();
   Serial.printf("BLE connection initiated (%d) - waiting for device...", (int)connected);
