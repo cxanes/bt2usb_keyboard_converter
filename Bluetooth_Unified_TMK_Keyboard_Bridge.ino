@@ -748,6 +748,11 @@ void handleStateTimeouts(unsigned long currentTime) {
 }
 
 void handleLEDPatterns(unsigned long currentTime) {
+  if (g_suspended) {
+    digitalWrite(LED_BUILTIN, LOW);
+    return;
+  }
+
   // Handle pairing celebration blinks first
   if (pairingBlinks > 0) {
     if (currentTime - pairingBlinkTimer >= 150) {

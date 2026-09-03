@@ -11,16 +11,8 @@ public:
 
   void begin(const uint8_t *layout = KeyboardLayout_en_US) override;
   void end() override;
-  virtual void sendReport(KeyReport* keys) override
-  {
-    Keyboard_::sendReport(keys);
-  }
-
-  virtual void sendConsumerReport(uint16_t key) override
-  {
-    Keyboard_::sendConsumerReport(key);
-  }
-
+  virtual void sendReport(KeyReport* keys) override;
+  virtual void sendConsumerReport(uint16_t key) override;
   void sendSystemReport(uint16_t key);
 
 private:
@@ -41,4 +33,5 @@ public:
 };
 
 extern MyMouse_ MyMouse;
+extern bool g_suspended;
 #endif
