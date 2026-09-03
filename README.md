@@ -7,6 +7,8 @@ Use a Pico W or Pico 2W to bridge a wireless keyboard to a USB host and use TMK 
 # Development Environment
 
 - Arduino-Pico
+- FS size: 64KB
+- USB stack: Pico SDK
 
 # Reference
 
