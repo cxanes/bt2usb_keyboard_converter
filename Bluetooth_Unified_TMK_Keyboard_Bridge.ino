@@ -23,12 +23,28 @@ extern "C" {
 #include <BluetoothHIDMaster.h>
 #include <Keyboard.h>
 #include <Mouse.h>
+#include <LittleFS.h>
 #if ENABLE_KEY_REMAP
 #include "host.h"
 #include "timer.h"
 #include "action.h"
 #include "my_hid_device.h"
 #endif
+
+// From libraries/BluetoothHIDMaster/examples/KeyboardPianoBLE/KeyboardPianoBLE.ino
+const char *DATAHEADER = "Last BLE Address"; // exactly 16 chars + \0
+
+typedef struct {
+  char hdr[16];     // The header marker so we know this is our data
+  uint8_t addr[6];  // MAC of the peer we last connected to
+  uint8_t addrType; // Type of address (normal or randomized) of the last peer
+} PairingInfo;
+
+const char *macToString(const uint8_t *addr, uint8_t addrType) {
+  static char mac[32];
+  sprintf(mac, "%02x:%02x:%02x:%02x:%02x:%02x,%d", addr[0], addr[1], addr[2], addr[3], addr[4], addr[5], addrType ? 1 : 0);
+  return mac;
+}
 
 // Connection state management
 typedef enum {
@@ -78,6 +94,60 @@ unsigned long stateStartTime = 0;
 const unsigned long CLASSIC_SCAN_TIMEOUT = 10000; // 10 seconds
 const unsigned long BLE_SCAN_TIMEOUT = 15000;     // 15 seconds
 const unsigned long BLE_CHECK_TIMEOUT = 5000;     // 5 seconds
+
+const char *PAIRING_INFO_PATH = "/pairing_info.bin";
+
+void loadPairingInfo() {
+  PairingInfo data = {};
+  File f = LittleFS.open(PAIRING_INFO_PATH, "r");
+  if (!f) {
+    Serial.printf("%p not found\n", PAIRING_INFO_PATH);
+    return;
+  }
+
+  int size = f.read((uint8_t *)&data, sizeof(PairingInfo));
+  if (size != sizeof(PairingInfo)) {
+    Serial.printf("%p read failed\n", PAIRING_INFO_PATH);
+    return;
+  }
+
+  f.close();
+
+  if (memcmp(data.hdr, DATAHEADER, sizeof(data.hdr))) {
+    // Not our data, just clear things
+    Serial.printf("No previous paired device found in %s\n", PAIRING_INFO_PATH);
+    bzero(bleLastConnectedAddress, 6);
+    bleLastConnectedAddressType = 0;
+  } else {
+    // Our baby, copy it to local storage
+    Serial.printf("Previoudly paired device found: %s\n", macToString(data.addr, data.addrType));
+    memcpy(bleLastConnectedAddress, data.addr, sizeof(bleLastConnectedAddress));
+    bleLastConnectedAddressType = data.addrType;
+  }
+}
+
+void savePairingInfo() {
+  PairingInfo data;
+  memcpy(data.hdr, DATAHEADER, sizeof(data.hdr));
+  memcpy(data.addr, bleLastConnectedAddress, sizeof(data.addr));
+  data.addrType = bleLastConnectedAddressType;
+
+  File f = LittleFS.open(PAIRING_INFO_PATH, "w");
+  if (!f) {
+    Serial.printf("%p not created\n", PAIRING_INFO_PATH);
+    return;
+  }
+
+  int size = f.write((uint8_t *)&data, sizeof(PairingInfo));
+  if (size != sizeof(PairingInfo)) {
+    Serial.printf("%p write failed\n", PAIRING_INFO_PATH);
+    return;
+  }
+
+  f.close();
+  Serial.printf("Wrote paired device to %s: %s\n", PAIRING_INFO_PATH,
+    macToString(bleLastConnectedAddress, bleLastConnectedAddressType));
+}
 
 #if ENABLE_KEY_REMAP
 #define Keyboard MyKeyboard
@@ -136,6 +206,9 @@ void setup() {
   ledTimer = millis();
   ledState = true;
   digitalWrite(LED_BUILTIN, HIGH);
+
+  LittleFS.begin();
+  loadPairingInfo();
   
   Serial.println("Starting Bluetooth stack initialization...");
   
@@ -261,6 +334,16 @@ void fallbackToBLE() {
   initAndScanBLE();
 }
 
+static inline bool isValidAddress(uint8_t (&address)[6])
+{
+  uint8_t value = 0;
+  for (int i = 0; i < 6; i++) {
+    value |= address[i];
+  }
+
+  return (value != 0);
+}
+
 void initAndScanBLE() {
   static bool inited = false;
   if (!inited) {
@@ -281,12 +364,25 @@ void initAndScanBLE() {
   }
 
   // Start BLE connection attempt
-  const bool connected = ble_hid.connectBLE();
-  Serial.printf("BLE connection initiated (%d) - waiting for device...", (int)connected);
-  //Serial.println("(BLE devices will be detected on first keypress)");
+  bool connected = false;
+  int type = 0;
+  if (isValidAddress(bleLastConnectedAddress)) {
+    type = 0;
+    Serial.printf("Connect paired device directly: %s\n", macToString(bleLastConnectedAddress, bleLastConnectedAddressType));
+    connected = ble_hid.connectBLE(bleLastConnectedAddress, bleLastConnectedAddressType);
+  } else {
+    type = 1;
+    Serial.println("Waiting for device...");
+    connected = ble_hid.connectBLE();
 
-  memcpy(bleLastConnectedAddress, ble_hid.lastConnectedAddress(), sizeof(bleLastConnectedAddress));
-  bleLastConnectedAddressType = ble_hid.lastConnectedAddressType();
+    memcpy(bleLastConnectedAddress, ble_hid.lastConnectedAddress(), sizeof(bleLastConnectedAddress));
+    bleLastConnectedAddressType = ble_hid.lastConnectedAddressType();
+    if (isValidAddress(bleLastConnectedAddress)) {
+      savePairingInfo();
+    }
+  }
+
+  Serial.printf("BLE connection initiated (%d, %d)\n", type, (int)connected);
 }
 
 void setupBLECallbacks() {
@@ -817,6 +913,8 @@ void handleBootselButton() {
     while (BOOTSEL) delay(1);
     
     Serial.println("\nBOOTSEL pressed - restarting scan sequence");
+
+    bzero(bleLastConnectedAddress, sizeof(bleLastConnectedAddress));
     
     // Clean up current connections
     if (connection_state == CLASSIC_CONNECTED) {
