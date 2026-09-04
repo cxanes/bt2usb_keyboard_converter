@@ -843,6 +843,11 @@ void handleStateTimeouts(unsigned long currentTime) {
   }
 }
 
+__attribute__((weak)) bool isUsbSuspended()
+{
+  return false;
+}
+
 void handleLEDPatterns(unsigned long currentTime) {
   if (isUsbSuspended()) {
     digitalWrite(LED_BUILTIN, LOW);
