@@ -32,6 +32,7 @@ public:
   }
 };
 
+bool isSuspended();
+
 extern MyMouse_ MyMouse;
-extern bool g_suspended;
 #endif

@@ -32,7 +32,10 @@ void MyKeyboard_::end()
   HID_Keyboard::end();
 }
 
-bool g_suspended = false;
+bool isSuspended()
+{
+  return tud_suspended();
+}
 
 void MyKeyboard_::sendReport(KeyReport* keys)
 {
@@ -48,14 +51,13 @@ void MyKeyboard_::sendReport(KeyReport* keys)
    *
    * so we need other trick:
    */
-  if (g_suspended && tud_suspended()) {
+  if (tud_suspended()) {
     Serial.println("Host is suspended, trying wakeup...");
     USB.disconnect();
     delay(100);
     USB.connect();
     delay(100);
     digitalWrite(LED_BUILTIN, HIGH);
-    g_suspended = false;
   }
 
   Keyboard_::sendReport(keys);
@@ -81,10 +83,3 @@ void MyKeyboard_::sendSystemReport(uint16_t key)
 
 MyKeyboard_ MyKeyboard;
 MyMouse_ MyMouse;
-
-extern "C" void tud_suspend_cb(bool remote_wakeup_en) {
-  Serial.printf("tud_suspend_cb (%d)\n", (int)remote_wakeup_en);
-  (void)remote_wakeup_en;
-  g_suspended = true;
-  digitalWrite(LED_BUILTIN, LOW);
-}

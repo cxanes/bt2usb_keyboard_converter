@@ -844,7 +844,7 @@ void handleStateTimeouts(unsigned long currentTime) {
 }
 
 void handleLEDPatterns(unsigned long currentTime) {
-  if (g_suspended) {
+  if (isSuspended()) {
     digitalWrite(LED_BUILTIN, LOW);
     return;
   }
