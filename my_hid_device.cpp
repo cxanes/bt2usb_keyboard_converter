@@ -32,7 +32,7 @@ void MyKeyboard_::end()
   HID_Keyboard::end();
 }
 
-bool isSuspended()
+bool isUsbSuspended()
 {
   return tud_suspended();
 }

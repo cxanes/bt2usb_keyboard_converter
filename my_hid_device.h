@@ -32,7 +32,7 @@ public:
   }
 };
 
-bool isSuspended();
+bool isUsbSuspended();
 
 extern MyMouse_ MyMouse;
 #endif
