@@ -1,8 +1,8 @@
-# Pico Bluetooth TMK Keyboard Bridge
+# Bluetooth to USB Keyboard Converter
 
 Inpired by https://learn.adafruit.com/pico-bluetooth-keyboard-bridge
 
-Use a Pico W or Pico 2W to bridge a wireless keyboard to a USB host and use TMK keyboard for key remapping.
+Use a Raspberry Pi Pico W or Pico 2W to bridge a wireless keyboard to a USB host and use TMK keyboard for key remapping.
 
 # Development Environment
 
