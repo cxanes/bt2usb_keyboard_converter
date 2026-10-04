@@ -54,9 +54,9 @@ void MyKeyboard_::sendReport(KeyReport* keys)
   if (tud_suspended()) {
     Serial.println("Host is suspended, trying wakeup...");
     USB.disconnect();
-    delay(100);
+    delay(500);
     USB.connect();
-    delay(100);
+    delay(500);
     digitalWrite(LED_BUILTIN, HIGH);
   }
 
