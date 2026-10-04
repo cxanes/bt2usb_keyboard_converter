@@ -11,6 +11,7 @@
 
 // === CONFIGURATION ===
 #define DEBUG_MODE false   // Set to false to reduce serial output
+#define ENABLE_SERIAL false  // Set to false to avoid possible usb/com port conflict
 #define BLINK_MODE false    // Set to false for solid LED (no keypress blinks)
 #define SCAN_MODE "BLE"   // Options: "BT_Classic", "BLE", "Both"
 #define ENABLE_KEY_REMAP 1
@@ -185,7 +186,9 @@ static host_driver_t g_hostDriver = {
 #endif
 
 void setup() {
-  Serial.begin(115200);
+  if (ENABLE_SERIAL || DEBUG_MODE) {
+    Serial.begin(115200);
+  }
   delay(3000);
 
   Serial.println("=== UNIFIED BLUETOOTH HID BRIDGE ===");
