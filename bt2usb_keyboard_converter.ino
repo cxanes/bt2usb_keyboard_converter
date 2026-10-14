@@ -766,6 +766,10 @@ void blinkOnActivity() {
 void loop() {
   unsigned long currentTime = millis();
 
+#if ENABLE_KEY_REMAP
+  MyKeyboard.tryWakeup();
+#endif
+
   // Handle state timeouts
   handleStateTimeouts(currentTime);
 

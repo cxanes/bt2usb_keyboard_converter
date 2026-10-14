@@ -37,12 +37,8 @@ bool isUsbSuspended()
   return tud_suspended();
 }
 
-void MyKeyboard_::sendReport(KeyReport* keys)
+void MyKeyboard_::tryWakeup()
 {
-  if (!_running) {
-    return;
-  }
-
   /*
    * If the remote has gone to sleep (laptop), tickle it so they will get the message
    * Following code doesn't work:
@@ -51,13 +47,28 @@ void MyKeyboard_::sendReport(KeyReport* keys)
    *
    * so we need other trick:
    */
-  if (tud_suspended()) {
+  if (_needWakeup) {
     Serial.println("Host is suspended, trying wakeup...");
     USB.disconnect();
     delay(500);
     USB.connect();
     delay(500);
     digitalWrite(LED_BUILTIN, HIGH);
+    _needWakeup = false;
+  }
+}
+
+void MyKeyboard_::sendReport(KeyReport* keys)
+{
+  if (!_running) {
+    return;
+  }
+
+  if (_needWakeup) {
+    return;
+  } else if (tud_suspended()) {
+    _needWakeup = true;
+    return;
   }
 
   Keyboard_::sendReport(keys);

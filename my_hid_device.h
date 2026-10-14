@@ -14,9 +14,11 @@ public:
   virtual void sendReport(KeyReport* keys) override;
   virtual void sendConsumerReport(uint16_t key) override;
   void sendSystemReport(uint16_t key);
+  void tryWakeup();
 
 private:
   uint8_t _idSystem = 0;
+  bool _needWakeup = false;
 };
 
 extern MyKeyboard_ MyKeyboard;
