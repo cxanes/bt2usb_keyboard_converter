@@ -17,8 +17,9 @@ public:
   void tryWakeup();
 
 private:
+  bool checkSuspended();
   uint8_t _idSystem = 0;
-  bool _needWakeup = false;
+  volatile bool _needWakeup = false;
 };
 
 extern MyKeyboard_ MyKeyboard;

@@ -50,24 +50,38 @@ void MyKeyboard_::tryWakeup()
   if (_needWakeup) {
     Serial.println("Host is suspended, trying wakeup...");
     USB.disconnect();
-    delay(500);
     USB.connect();
-    delay(500);
+    unsigned long timeout = millis() + 3000;
+    while (!tud_mounted() && millis() < timeout) {
+      // wait enumeration
+      delay(10);
+    }
+
     digitalWrite(LED_BUILTIN, HIGH);
+    asm volatile("" ::: "memory");
     _needWakeup = false;
   }
 }
 
-void MyKeyboard_::sendReport(KeyReport* keys)
+bool MyKeyboard_::checkSuspended()
 {
   if (!_running) {
-    return;
+    return true;
   }
 
   if (_needWakeup) {
-    return;
+    return true;
   } else if (tud_suspended()) {
     _needWakeup = true;
+    return true;
+  }
+
+  return false;
+}
+
+void MyKeyboard_::sendReport(KeyReport* keys)
+{
+  if (checkSuspended()) {
     return;
   }
 
@@ -76,11 +90,19 @@ void MyKeyboard_::sendReport(KeyReport* keys)
 
 void MyKeyboard_::sendConsumerReport(uint16_t key)
 {
-    Keyboard_::sendConsumerReport(key);
+  if (checkSuspended()) {
+    return;
+  }
+
+  Keyboard_::sendConsumerReport(key);
 }
 
 void MyKeyboard_::sendSystemReport(uint16_t key)
 {
+  if (checkSuspended()) {
+    return;
+  }
+
   if (!_running) {
     return;
   }
