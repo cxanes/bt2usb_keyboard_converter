@@ -8,7 +8,15 @@ Use a Raspberry Pi Pico W or Pico 2W to bridge a wireless keyboard to a USB host
 
 - Arduino-Pico
 - FS size: 64KB
-- USB stack: Pico SDK
+- USB stack: Adafruit TinyUSB
+
+# Keymapping
+
+- keymap_user.c
+
+# Support keyboards
+
+- Realforce R4
 
 # Reference
 

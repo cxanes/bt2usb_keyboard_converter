@@ -11,6 +11,8 @@
 
 // === CONFIGURATION ===
 #define DEBUG_MODE false   // Set to false to reduce serial output
+// Serial interface is removed for remote wakeup support
+// Uncomment macro TINYHID_NO_CDC in my_hid_device.h to bring Serial interface back
 #define ENABLE_SERIAL false  // Set to false to avoid possible usb/com port conflict
 #define BLINK_MODE false    // Set to false for solid LED (no keypress blinks)
 #define SCAN_MODE "BLE"   // Options: "BT_Classic", "BLE", "Both"
@@ -22,14 +24,15 @@ extern "C" {
 }
 #include <BluetoothHCI.h>
 #include <BluetoothHIDMaster.h>
-#include <Keyboard.h>
-#include <Mouse.h>
 #include <LittleFS.h>
 #if ENABLE_KEY_REMAP
 #include "host.h"
 #include "timer.h"
 #include "action.h"
 #include "my_hid_device.h"
+#else
+#include <Keyboard.h>
+#include <Mouse.h>
 #endif
 
 // From libraries/BluetoothHIDMaster/examples/KeyboardPianoBLE/KeyboardPianoBLE.ino
@@ -151,8 +154,6 @@ void savePairingInfo() {
 }
 
 #if ENABLE_KEY_REMAP
-#define Keyboard MyKeyboard
-
 static void send_keyboard(report_keyboard_t *report)
 {
   Keyboard.sendReport((KeyReport*)report);
@@ -167,8 +168,6 @@ static void send_system(uint16_t key)
 {
   Keyboard.sendSystemReport(key);
 }
-
-#define Mouse MyMouse
 
 static void send_mouse(report_mouse_t *report)
 {
@@ -766,10 +765,6 @@ void blinkOnActivity() {
 void loop() {
   unsigned long currentTime = millis();
 
-#if ENABLE_KEY_REMAP
-  MyKeyboard.tryWakeup();
-#endif
-
   // Handle state timeouts
   handleStateTimeouts(currentTime);
 
@@ -852,11 +847,18 @@ void handleStateTimeouts(unsigned long currentTime) {
 
 __attribute__((weak)) bool isUsbSuspended()
 {
-  return false;
+  //return false;
+  return TinyHID.suspended();
 }
 
 void handleLEDPatterns(unsigned long currentTime) {
-  if (isUsbSuspended()) {
+  static bool prevIsSuspended = false;
+  bool currentIsSuspended = isUsbSuspended();
+  if (prevIsSuspended != currentIsSuspended) {
+    digitalWrite(LED_BUILTIN, currentIsSuspended ? HIGH : LOW);
+    prevIsSuspended = currentIsSuspended;
+    return;
+  } else if (currentIsSuspended) {
     digitalWrite(LED_BUILTIN, LOW);
     return;
   }
