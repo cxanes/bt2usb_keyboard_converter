@@ -21,11 +21,6 @@
 #pragma once
 #include <Arduino.h>
 
-// Uncomment to remove the default CDC Serial interface and make the device HID-only.
-// If compilation fails because clearConfiguration is not found, update the Adafruit TinyUSB library.
-// NOTE: Remove CDC for remote wakeup support
-#define TINYHID_NO_CDC
-
 // ---- Key constants (same as the Arduino Keyboard library) ----
 #define KEY_LEFT_CTRL     0x80
 #define KEY_LEFT_SHIFT    0x81
@@ -117,6 +112,12 @@ public:
   bool suspended();        // True if the device is in USB suspend
   bool remoteWakeup();     // Issue remote wakeup; returns false if the host has not enabled it
   bool ready();            // Enumerated and not suspended
+
+  // Remove the default CDC Serial interface and make the device HID-only.
+  // NOTE: Serial may cause the remote wakeup to fail
+  void removeSerial();
+private:
+  bool _removeSerial = false;
 };
 
 class TinyKeyboard : public Print {

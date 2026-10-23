@@ -72,6 +72,10 @@ TinyHIDDevice TinyHID;
 TinyKeyboard Keyboard;
 TinyMouse Mouse;
 
+void TinyHIDDevice::removeSerial() {
+  _removeSerial = true;
+}
+
 void TinyHIDDevice::begin() {
   if (hidStarted) return;
   hidStarted = true;
@@ -80,9 +84,10 @@ void TinyHIDDevice::begin() {
     TinyUSBDevice.begin(0);
   }
 
-#ifdef TINYHID_NO_CDC
-  TinyUSBDevice.clearConfiguration();
-#endif
+  if (_removeSerial) {
+    // If compilation fails because clearConfiguration is not found, update the Adafruit TinyUSB library.
+    TinyUSBDevice.clearConfiguration();
+  }
 
   // Interface A: Boot Keyboard
   kbdHid.setBootProtocol(HID_ITF_PROTOCOL_KEYBOARD);

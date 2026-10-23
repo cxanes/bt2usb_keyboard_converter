@@ -11,329 +11,85 @@
 
 // === CONFIGURATION ===
 #define DEBUG_MODE false   // Set to false to reduce serial output
-// Serial interface is removed for remote wakeup support
-// Uncomment macro TINYHID_NO_CDC in my_hid_device.h to bring Serial interface back
 #define ENABLE_SERIAL false  // Set to false to avoid possible usb/com port conflict
-#define BLINK_MODE false    // Set to false for solid LED (no keypress blinks)
-#define SCAN_MODE "BLE"   // Options: "BT_Classic", "BLE", "Both"
 #define ENABLE_KEY_REMAP 1
 
-// Include both Bluetooth stacks
-extern "C" {
-#include "btstack.h"
-}
-#include <BluetoothHCI.h>
 #include <BluetoothHIDMaster.h>
 #include <LittleFS.h>
+#include "my_hid_device.h"
 #if ENABLE_KEY_REMAP
 #include "host.h"
 #include "timer.h"
 #include "action.h"
-#include "my_hid_device.h"
-#else
-#include <Keyboard.h>
-#include <Mouse.h>
 #endif
 
-// From libraries/BluetoothHIDMaster/examples/KeyboardPianoBLE/KeyboardPianoBLE.ino
-const char *DATAHEADER = "Last BLE Address"; // exactly 16 chars + \0
+enum class ScanMode {
+  BT,
+  BLE,
+  BOTH
+};
 
-typedef struct {
-  char hdr[16];     // The header marker so we know this is our data
-  uint8_t addr[6];  // MAC of the peer we last connected to
-  uint8_t addrType; // Type of address (normal or randomized) of the last peer
-} PairingInfo;
+// Connection state management
+enum class ConnectionState {
+    INIT,
+    CONNECTING,
+    CONNECTED
+};
 
-const char *macToString(const uint8_t *addr, uint8_t addrType) {
+const ScanMode SCAN_MODE = ScanMode::BLE;
+
+static ConnectionState g_state = ConnectionState::INIT;
+static BluetoothHIDMaster g_btHID;
+static HIDKeyStream g_keyStream;
+static bool g_isBLE = false;
+
+// Timing management
+unsigned long g_stateStartTime = 0;
+const unsigned long CLASSIC_SCAN_TIMEOUT = 10000;
+const unsigned long BLE_SCAN_TIMEOUT = 15000;
+const unsigned long CONNECTION_CHECK_TIMEOUT = 5000;
+
+class LEDBlinker {
+public:
+  LEDBlinker() = default;
+  ~LEDBlinker() = default;
+
+  void SetLED(bool on)
+  {
+    digitalWrite(LED_BUILTIN, on ? HIGH : LOW);
+    m_led = on;
+  }
+
+  void SetInterval(uint32_t interval)
+  {
+    m_interval = interval;
+  }
+
+  void Blink()
+  {
+    if (m_interval == 0) {
+      return;
+    }
+
+    unsigned long currentTime = millis();
+    if (currentTime >= m_timer) {
+      SetLED(!m_led);
+
+      m_timer = currentTime + m_interval;
+    }
+  }
+
+private:
+  bool m_led = false;
+  uint32_t m_interval = 0;
+  unsigned long m_timer = 0;
+};
+
+static const char *macToString(const uint8_t *addr, uint8_t addrType)
+{
   static char mac[32];
   sprintf(mac, "%02x:%02x:%02x:%02x:%02x:%02x,%d", addr[0], addr[1], addr[2], addr[3], addr[4], addr[5], addrType ? 1 : 0);
   return mac;
-}
-
-// Connection state management
-typedef enum {
-    INIT,
-    SCANNING_CLASSIC,
-    CLASSIC_CONNECTING,
-    CLASSIC_CONNECTED,
-    SCANNING_BLE,
-    BLE_CONNECTED,
-    BOTH_FAILED,
-    DISCONNECTED
-} connection_state_t;
-
-connection_state_t connection_state = INIT;
-
-// BT Classic components
-BluetoothHCI hci;
-bd_addr_t target_keyboard_addr;
-bool target_keyboard_found = false;
-uint16_t hid_control_cid = 0;
-uint16_t hid_interrupt_cid = 0;
-static btstack_packet_callback_registration_t hci_event_callback_registration;
-
-// BLE components
-BluetoothHIDMaster ble_hid;
-HIDKeyStream keystream;
-static uint8_t bleLastConnectedAddress[6] = {};
-static uint8_t bleLastConnectedAddressType = 0;
-static unsigned long bleCheckConnectionTime = 0;
-
-// Shared state tracking
-static uint8_t last_modifiers = 0;
-static uint8_t last_keys[6] = {0};
-bool keyPressed[256] = {0}; // Track which keys are currently pressed
-
-// LED management
-unsigned long ledTimer = 0;
-bool ledState = false;
-unsigned long ledOffTime = 0;
-bool ledBlinking = false;
-int pairingBlinks = 0;
-unsigned long pairingBlinkTimer = 0;
-
-// Timing management
-unsigned long lastScan = 0;
-unsigned long stateStartTime = 0;
-const unsigned long CLASSIC_SCAN_TIMEOUT = 10000; // 10 seconds
-const unsigned long BLE_SCAN_TIMEOUT = 15000;     // 15 seconds
-const unsigned long BLE_CHECK_TIMEOUT = 5000;     // 5 seconds
-
-const char *PAIRING_INFO_PATH = "/pairing_info.bin";
-
-void loadPairingInfo() {
-  PairingInfo data = {};
-  File f = LittleFS.open(PAIRING_INFO_PATH, "r");
-  if (!f) {
-    Serial.printf("%p not found\n", PAIRING_INFO_PATH);
-    return;
-  }
-
-  int size = f.read((uint8_t *)&data, sizeof(PairingInfo));
-  if (size != sizeof(PairingInfo)) {
-    Serial.printf("%p read failed\n", PAIRING_INFO_PATH);
-    return;
-  }
-
-  f.close();
-
-  if (memcmp(data.hdr, DATAHEADER, sizeof(data.hdr))) {
-    // Not our data, just clear things
-    Serial.printf("No previous paired device found in %s\n", PAIRING_INFO_PATH);
-    bzero(bleLastConnectedAddress, 6);
-    bleLastConnectedAddressType = 0;
-  } else {
-    // Our baby, copy it to local storage
-    Serial.printf("Previoudly paired device found: %s\n", macToString(data.addr, data.addrType));
-    memcpy(bleLastConnectedAddress, data.addr, sizeof(bleLastConnectedAddress));
-    bleLastConnectedAddressType = data.addrType;
-  }
-}
-
-void savePairingInfo() {
-  PairingInfo data;
-  memcpy(data.hdr, DATAHEADER, sizeof(data.hdr));
-  memcpy(data.addr, bleLastConnectedAddress, sizeof(data.addr));
-  data.addrType = bleLastConnectedAddressType;
-
-  File f = LittleFS.open(PAIRING_INFO_PATH, "w");
-  if (!f) {
-    Serial.printf("%p not created\n", PAIRING_INFO_PATH);
-    return;
-  }
-
-  int size = f.write((uint8_t *)&data, sizeof(PairingInfo));
-  if (size != sizeof(PairingInfo)) {
-    Serial.printf("%p write failed\n", PAIRING_INFO_PATH);
-    return;
-  }
-
-  f.close();
-  Serial.printf("Wrote paired device to %s: %s\n", PAIRING_INFO_PATH,
-    macToString(bleLastConnectedAddress, bleLastConnectedAddressType));
-}
-
-#if ENABLE_KEY_REMAP
-static void send_keyboard(report_keyboard_t *report)
-{
-  Keyboard.sendReport((KeyReport*)report);
-}
-
-static void send_consumer(uint16_t key)
-{
-  Keyboard.sendConsumerReport(key);
-}
-
-static void send_system(uint16_t key)
-{
-  Keyboard.sendSystemReport(key);
-}
-
-static void send_mouse(report_mouse_t *report)
-{
-  Mouse.buttons(report->buttons);
-  Mouse.move(report->x, report->y, report->v);
-}
-
-static host_driver_t g_hostDriver = {
-  NULL,
-  &send_keyboard,
-  &send_mouse,
-  &send_system,
-  &send_consumer
-};
-#endif
-
-void setup() {
-  if (ENABLE_SERIAL || DEBUG_MODE) {
-    Serial.begin(115200);
-  }
-  delay(3000);
-
-  Serial.println("=== UNIFIED BLUETOOTH HID BRIDGE ===");
-  Serial.printf("Scan mode: %s\n", SCAN_MODE);
-  Serial.println("Put your Bluetooth device in pairing mode now");
-
-  // Initialize LED
-  pinMode(LED_BUILTIN, OUTPUT);
-  digitalWrite(LED_BUILTIN, LOW);
-  Serial.println("LED initialized");
-
-  // Initialize USB HID
-  Keyboard.begin();
-  Mouse.begin();
-  Serial.println("USB HID initialized");
-
-  // Start with LED blinking to show we're alive
-  ledTimer = millis();
-  ledState = true;
-  digitalWrite(LED_BUILTIN, HIGH);
-
-  LittleFS.begin();
-  loadPairingInfo();
-
-  Serial.println("Starting Bluetooth stack initialization...");
-
-  // Choose scan mode based on user setting
-  if (strcmp(SCAN_MODE, "BT_Classic") == 0) {
-    Serial.println("BT Classic only mode");
-    connection_state = SCANNING_CLASSIC;
-    stateStartTime = millis();
-    initAndScanClassic();
-  } else if (strcmp(SCAN_MODE, "BLE") == 0) {
-    Serial.println("BLE only mode");
-    connection_state = SCANNING_BLE;
-    stateStartTime = millis();
-    initAndScanBLE();
-  } else {
-    Serial.println("Both protocols mode - trying Classic first");
-    connection_state = SCANNING_CLASSIC;
-    stateStartTime = millis();
-    initAndScanClassic();
-  }
-
-#if ENABLE_KEY_REMAP
-  host_set_driver(&g_hostDriver);
-#endif
-}
-
-void initAndScanClassic() {
-  Serial.println("\n=== INITIALIZING BT CLASSIC STACK ===");
-
-  // Initialize HCI for Classic
-  l2cap_init();
-  sm_init();
-  gap_set_default_link_policy_settings(LM_LINK_POLICY_ENABLE_SNIFF_MODE | LM_LINK_POLICY_ENABLE_ROLE_SWITCH);
-  hci_set_master_slave_policy(HCI_ROLE_MASTER);
-  hci_set_inquiry_mode(INQUIRY_MODE_RSSI_AND_EIR);
-
-  Serial.println("BTStack components initialized");
-
-  hci.install();
-  hci.begin();
-  Serial.println("HCI installed and started");
-
-  // Register BTStack event handler
-  hci_event_callback_registration.callback = &classic_packet_handler;
-  hci_add_event_handler(&hci_event_callback_registration);
-  Serial.println("Event handler registered");
-
-  // Turn on Bluetooth
-  hci_power_control(HCI_POWER_ON);
-  Serial.println("Bluetooth power ON");
-
-  delay(2000); // Give it time to initialize
-
-  Serial.println("Starting BT Classic device scan...");
-  scanForClassicDevices();
-}
-
-void scanForClassicDevices() {
-  Serial.println("Scanning for BT Classic devices...");
-
-  auto devices = hci.scan(BluetoothHCI::any_cod);
-
-  Serial.printf("Classic scan completed. Found %d devices:\n", devices.size());
-
-  if (devices.size() == 0) {
-    Serial.println("No Classic devices found. Will try BLE after timeout.");
-    return;
-  }
-
-  Serial.println("Address           | RSSI | Class    | Name");
-  Serial.println("------------------|------|----------|------------------");
-
-  for (auto device : devices) {
-    uint32_t cod = device.deviceClass();
-    uint8_t majorClass = (cod >> 8) & 0x1F;
-    uint8_t minorClass = (cod >> 2) & 0x3F;
-
-    Serial.printf("%s | %4d | %08lx | %s",
-                 device.addressString(), device.rssi(), cod, device.name());
-
-    // Look for HID keyboards in Classic scan
-    if (majorClass == 5 && (minorClass & 0x10)) {  // HID Keyboard
-      Serial.print(" [HID KEYBOARD] *** CONNECTING ***");
-
-      // We found a Classic keyboard!
-      const char* addrStr = device.addressString();
-      sscanf(addrStr, "%hhx:%hhx:%hhx:%hhx:%hhx:%hhx",
-             &target_keyboard_addr[0], &target_keyboard_addr[1], &target_keyboard_addr[2],
-             &target_keyboard_addr[3], &target_keyboard_addr[4], &target_keyboard_addr[5]);
-      target_keyboard_found = true;
-
-      Serial.printf("\nFound Classic HID keyboard: %s\n", device.name());
-      Serial.printf("Address: %s\n", device.addressString());
-
-      // Start Classic connection
-      connection_state = CLASSIC_CONNECTING;
-      stateStartTime = millis();
-      startClassicConnection();
-
-      Serial.println();
-      return; // Exit the loop - we found our keyboard
-    } else {
-      // Show device type for debugging
-      switch (majorClass) {
-        case 1: Serial.print(" [Computer]"); break;
-        case 2: Serial.print(" [Phone]"); break;
-        case 3: Serial.print(" [Network]"); break;
-        case 4: Serial.print(" [Audio/Video]"); break;
-        case 5: Serial.print(" [HID Device]"); break;
-        default: Serial.printf(" [Class:%d]", majorClass); break;
-      }
-    }
-    Serial.println();
-  }
-
-  Serial.println("No HID keyboards found in Classic scan.");
-}
-
-void fallbackToBLE() {
-  Serial.println("\n=== FALLING BACK TO BLE ===");
-  connection_state = SCANNING_BLE;
-  stateStartTime = millis();
-  initAndScanBLE();
 }
 
 static inline bool isValidAddress(uint8_t (&address)[6])
@@ -346,242 +102,198 @@ static inline bool isValidAddress(uint8_t (&address)[6])
   return (value != 0);
 }
 
-void initAndScanBLE() {
-  static bool inited = false;
-  if (!inited) {
-    Serial.println("Initializing BLE stack...");
+static LEDBlinker g_ledBlinker{};
 
-    // Setup the HID key to ASCII conversion
-    keystream.begin();
-    Serial.println("KeyStream initialized");
+class PairingManager {
+  struct PairingInfo {
+    char hdr[16];     // The header marker so we know this is our data
+    uint8_t addr[6];  // MAC of the peer we last connected to
+    uint8_t addrType; // Type of address (normal or randomized) of the last peer
+  };
 
-    // Setup BLE callbacks
-    setupBLECallbacks();
-    Serial.println("BLE callbacks configured");
+public:
+  PairingManager()
+  {}
 
-    // Start BLE HID master
-    ble_hid.begin(true);
-    Serial.println("BLE HID master started");
-    inited = true;
-  }
+  ~PairingManager()
+  {}
 
-  // Start BLE connection attempt
-  bool connected = false;
-  int type = 0;
-  if (isValidAddress(bleLastConnectedAddress)) {
-    type = 0;
-    Serial.printf("Connect paired device directly: %s\n", macToString(bleLastConnectedAddress, bleLastConnectedAddressType));
-    connected = ble_hid.connectBLE(bleLastConnectedAddress, bleLastConnectedAddressType);
-  } else {
-    type = 1;
-    Serial.println("Waiting for device...");
-    connected = ble_hid.connectBLE();
-
-    memcpy(bleLastConnectedAddress, ble_hid.lastConnectedAddress(), sizeof(bleLastConnectedAddress));
-    bleLastConnectedAddressType = ble_hid.lastConnectedAddressType();
-    if (isValidAddress(bleLastConnectedAddress)) {
-      savePairingInfo();
+  void init()
+  {
+    PairingInfo data = {};
+    File f = LittleFS.open(PAIRING_INFO_PATH, "r");
+    if (!f) {
+      Serial.printf("%p not found\n", PAIRING_INFO_PATH);
+      return;
     }
-  }
 
-  Serial.printf("BLE connection initiated (%d, %d)\n", type, (int)connected);
-}
-
-void setupBLECallbacks() {
-  // BLE Mouse callbacks
-  ble_hid.onMouseMove([](void *cbdata, int dx, int dy, int dw) {
-    (void) cbdata;
-    if (DEBUG_MODE) {
-      Serial.printf("BLE Mouse: X:%d  Y:%d  Wheel:%d\n", dx, dy, dw);
+    int size = f.read((uint8_t *)&data, sizeof(PairingInfo));
+    if (size != sizeof(PairingInfo)) {
+      Serial.printf("%p read failed\n", PAIRING_INFO_PATH);
+      return;
     }
-    Mouse.move(dx, dy);
-    if (dw != 0) Mouse.move(0, 0, dw);
-    blinkOnActivity();
-  });
 
-  ble_hid.onMouseButton([](void *cbdata, int butt, bool down) {
-    (void) cbdata;
-    if (DEBUG_MODE) {
-      Serial.printf("BLE Mouse: Button %d %s\n", butt, down ? "DOWN" : "UP");
-    }
-    if (down) {
-      if (butt == 1) Mouse.press(MOUSE_LEFT);
-      else if (butt == 2) Mouse.press(MOUSE_RIGHT);
-      else if (butt == 3) Mouse.press(MOUSE_MIDDLE);
+    f.close();
+
+    if (memcmp(data.hdr, DATAHEADER, sizeof(data.hdr))) {
+      // Not our data, just clear things
+      Serial.printf("No previous paired device found in %s\n", PAIRING_INFO_PATH);
+      bzero(m_lastAddr, 6);
+      m_lastAddrType = 0;
     } else {
-      if (butt == 1) Mouse.release(MOUSE_LEFT);
-      else if (butt == 2) Mouse.release(MOUSE_RIGHT);
-      else if (butt == 3) Mouse.release(MOUSE_MIDDLE);
+      // Our baby, copy it to local storage
+      Serial.printf("Previoudly paired device found: %s\n", macToString(data.addr, data.addrType));
+      memcpy(m_lastAddr, data.addr, sizeof(m_lastAddr));
+      m_lastAddrType = data.addrType;
     }
-    blinkOnActivity();
-  });
-
-  // BLE Keyboard callbacks
-  ble_hid.onKeyDown([](void *cbdata, int key) {
-    handleBLEKey(key, true);
-  }, (void *)true);
-
-  ble_hid.onKeyUp([](void *cbdata, int key) {
-    handleBLEKey(key, false);
-  }, (void *)false);
-}
-
-void startClassicConnection() {
-  if (!target_keyboard_found) {
-    Serial.println("ERROR: No Classic target keyboard found");
-    fallbackToBLE();
-    return;
   }
 
-  Serial.println("=== STARTING CLASSIC HID CONNECTION ===");
-  Serial.println("Creating L2CAP Control channel...");
-
-  // Create control channel first
-  l2cap_create_channel(&classic_packet_handler, target_keyboard_addr, BLUETOOTH_PSM_HID_CONTROL,
-                       48, &hid_control_cid);
-}
-
-void handleBLEKey(int key, bool state) {
-  if (DEBUG_MODE) {
-    Serial.printf("BLE Keyboard: %02x %s\n", key, state ? "DOWN" : "UP");
+  void clear()
+  {
+    bzero(m_lastAddr, sizeof(m_lastAddr));
   }
 
-  if (key >= 256) return; // Bounds check
-
-  // Check if this is the first BLE key press (connection detection)
-  if (connection_state == SCANNING_BLE) {
-    Serial.printf("\n*** BLE KEYBOARD DETECTED ON FIRST KEYPRESS ***\n");
-    Serial.printf("=== BLE DEVICE CONNECTED ===\n");
-    Serial.printf("Ready to forward BLE input to USB.\n");
-    Serial.printf("========================\n");
-
-    connection_state = BLE_CONNECTED;
-    celebrationBlinks(8); // 4 blinks for BLE
-
-    bleCheckConnectionTime = millis();
-    // After celebration, LED will go solid (handled in LED patterns)
-  }
-
-  // Forward the key to USB
-  forwardBLEKeyToUSB(key, state);
-  blinkOnActivity();
-}
-
-void classic_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet, uint16_t size) {
-  UNUSED(size);
-
-  if (packet_type == HCI_EVENT_PACKET) {
-    uint8_t event = hci_event_packet_get_type(packet);
-
-    switch (event) {
-      case BTSTACK_EVENT_STATE:
-        if (btstack_event_state_get_state(packet) == HCI_STATE_WORKING) {
-          Serial.println("Classic BTstack ready");
-        }
-        break;
-
-      case L2CAP_EVENT_CHANNEL_OPENED:
-        {
-          uint16_t cid = l2cap_event_channel_opened_get_local_cid(packet);
-          uint16_t psm = l2cap_event_channel_opened_get_psm(packet);
-          uint8_t status = l2cap_event_channel_opened_get_status(packet);
-
-          if (status) {
-            Serial.printf("Classic L2CAP connection failed, status 0x%02x\n", status);
-            handleClassicConnectionError(status);
-            return;
-          }
-
-          Serial.printf("Classic L2CAP channel opened: CID=0x%04x, PSM=0x%04x\n", cid, psm);
-
-          if (psm == BLUETOOTH_PSM_HID_CONTROL) {
-            hid_control_cid = cid;
-            Serial.println("Classic HID Control channel established");
-            Serial.println("Creating L2CAP Interrupt channel...");
-
-            // Create interrupt channel
-            l2cap_create_channel(&classic_packet_handler, target_keyboard_addr, BLUETOOTH_PSM_HID_INTERRUPT,
-                                48, &hid_interrupt_cid);
-          } else if (psm == BLUETOOTH_PSM_HID_INTERRUPT) {
-            hid_interrupt_cid = cid;
-            Serial.println("Classic HID Interrupt channel established");
-            Serial.println("*** CLASSIC HID CONNECTION COMPLETE ***");
-            connection_state = CLASSIC_CONNECTED;
-
-            celebrationBlinks(6); // 3 blinks for Classic
-
-            // After celebration, LED will go solid (handled in LED patterns)
-          }
-        }
-        break;
-
-      case L2CAP_EVENT_CHANNEL_CLOSED:
-        {
-          uint16_t cid = l2cap_event_channel_closed_get_local_cid(packet);
-          Serial.printf("Classic L2CAP channel closed: CID=0x%04x\n", cid);
-
-          if (cid == hid_control_cid) {
-            hid_control_cid = 0;
-          } else if (cid == hid_interrupt_cid) {
-            hid_interrupt_cid = 0;
-          }
-
-          if (hid_control_cid == 0 && hid_interrupt_cid == 0) {
-            Serial.println("Classic HID connection lost.");
-            connection_state = DISCONNECTED;
-            target_keyboard_found = false;
-          }
-        }
-        break;
-
-      default:
-        break;
-    }
-  } else if (packet_type == L2CAP_DATA_PACKET) {
-    // Classic HID input data
-    if (channel == hid_interrupt_cid) {
-      if (DEBUG_MODE) {
-        Serial.printf("Classic HID Input Data (%d bytes): ", size);
-        for (int i = 0; i < size; i++) {
-          Serial.printf("%02X ", packet[i]);
-        }
-        Serial.println();
+  bool connect(BluetoothHIDMaster &hid, bool ble)
+  {
+    bool connected = false;
+    int type = 0;
+    if (isValidAddress(m_lastAddr)) {
+      type = 0;
+      Serial.printf("Connect paired device directly: %s\n", macToString(m_lastAddr, m_lastAddrType));
+      if (ble) {
+        connected = g_btHID.connectBLE(m_lastAddr, m_lastAddrType, ledBlink);
+      } else {
+        connected = g_btHID.connect(m_lastAddr);
+      }
+    } else {
+      type = 1;
+      Serial.println("Waiting for device...");
+      if (ble) {
+        connected = g_btHID.connectBLE(ledBlink);
+      } else {
+        connected = g_btHID.connectAny();
       }
 
-      processClassicHIDReport(packet, size);
+      memcpy(m_lastAddr, g_btHID.lastConnectedAddress(), sizeof(m_lastAddr));
+      m_lastAddrType = g_btHID.lastConnectedAddressType();
+      if (isValidAddress(m_lastAddr)) {
+        savePairingInfo();
+      }
     }
-  }
-}
 
-void handleClassicConnectionError(uint8_t status) {
-  Serial.printf("Classic connection failed with status 0x%02x - ", status);
-  switch (status) {
-    case 0x04: Serial.println("Page timeout"); break;
-    case 0x05: Serial.println("Authentication failure"); break;
-    case 0x08: Serial.println("Connection timeout"); break;
-    default: Serial.printf("Error code 0x%02x\n", status); break;
+    Serial.printf("%s connection initiated (%d, %d)\n", ble ? "BLE" : "BT", type, (int)connected);
+    return connected;
   }
 
-  Serial.println("Trying BLE fallback...");
-  fallbackToBLE();
-}
+private:
+  void savePairingInfo()
+  {
+    PairingInfo data;
+    memcpy(data.hdr, DATAHEADER, sizeof(data.hdr));
+    memcpy(data.addr, m_lastAddr, sizeof(data.addr));
+    data.addrType = m_lastAddrType;
 
-void processClassicHIDReport(uint8_t *report, uint16_t length) {
-  if (length < 10) {
-    Serial.printf("Invalid Classic HID report length: %d\n", length);
-    return;
+    File f = LittleFS.open(PAIRING_INFO_PATH, "w");
+    if (!f) {
+      Serial.printf("%p not created\n", PAIRING_INFO_PATH);
+      return;
+    }
+
+    int size = f.write((uint8_t *)&data, sizeof(PairingInfo));
+    if (size != sizeof(PairingInfo)) {
+      Serial.printf("%p write failed\n", PAIRING_INFO_PATH);
+      return;
+    }
+
+    f.close();
+    Serial.printf("Wrote paired device to %s: %s\n", PAIRING_INFO_PATH,
+      macToString(m_lastAddr, m_lastAddrType));
   }
 
-  uint8_t modifiers = report[2];
-  uint8_t *keys = &report[4];
+  uint8_t m_lastAddr[6] = {};
+  uint8_t m_lastAddrType = 0;
 
-  // Forward to USB HID
-  forwardClassicToUSB(modifiers, keys);
-  blinkOnActivity();
-}
+  // From libraries/BluetoothHIDMaster/examples/KeyboardPianoBLE/KeyboardPianoBLE.ino
+  static constexpr const char *DATAHEADER = "Last BLE Address"; // exactly 16 chars + \0
+  static constexpr const char *PAIRING_INFO_PATH = "/pairing_info.bin";
 
-// Shared key mapping function
-uint8_t hidToUsbKey(uint8_t hidKey) {
+  static void ledBlink(void *data)
+  {
+    g_ledBlinker.Blink();
+  }
+};
+
+#if ENABLE_KEY_REMAP
+static host_driver_t g_hostDriver = {
+  NULL,
+  [](report_keyboard_t *report) {
+    Keyboard.sendReport((KeyReport*)report);
+  },
+  [](report_mouse_t *report) {
+    Mouse.buttons(report->buttons);
+    Mouse.move(report->x, report->y, report->v);
+  },
+  [](uint16_t key) {
+    Keyboard.sendSystemReport(key);
+  },
+  [](uint16_t key) {
+    Keyboard.sendConsumerReport(key);
+  }
+};
+
+/* KEY CODE to Matrix
+ *
+ * HID keycode(1 byte):
+ * Higher 5 bits indicates ROW and lower 3 bits COL.
+ *
+ *  7 6 5 4 3 2 1 0
+ * +---------------+
+ * |  ROW  |  COL  |
+ * +---------------+
+ *
+ * Matrix space(16 * 16):
+ *   r\c0123456789ABCDEF
+ *   0 +----------------+
+ *   : |                |
+ *   : |                |
+ *  16 +----------------+
+ *
+ * From: tmk_keyboard/converter/usb_usb/usb_usb.cpp
+ */
+#define ROW_MASK 0xF0
+#define COL_MASK 0x0F
+#define CODE(row, col)  (((row) << 4) | (col))
+#define ROW(code)       ((uint8_t)(((code) & ROW_MASK) >> 4))
+#define COL(code)       ((uint8_t)((code) & COL_MASK))
+class KeyHandler {
+public:
+  KeyHandler() = default;
+  ~KeyHandler() = default;
+
+  void init()
+  {
+    host_set_driver(&g_hostDriver);
+  }
+
+  void handle(int key, bool state)
+  {
+    if (key >= 256) return;
+
+    keyevent_t e = (keyevent_t){
+      .key = (keypos_t){.col = COL(key), .row = ROW(key) },
+      .pressed = state,
+      .time = (uint16_t)(timer_read() | 1) /* time should not be 0 */
+    };
+
+    action_exec(e);
+  }
+
+  void clear()
+  {}
+};
+#else
+static uint8_t hidToUsbKey(uint8_t hidKey)
+{
   switch (hidKey) {
     // Letters
     case 0x04: return 'a';    case 0x05: return 'b';    case 0x06: return 'c';    case 0x07: return 'd';
@@ -632,134 +344,175 @@ uint8_t hidToUsbKey(uint8_t hidKey) {
   }
 }
 
-void forwardClassicToUSB(uint8_t modifiers, uint8_t *keys) {
-  // Handle modifier changes
-  uint8_t modifier_changes = modifiers ^ last_modifiers;
+class KeyHandler {
+public:
+  KeyHandler() = default;
+  ~KeyHandler() = default;
 
-  // Process each modifier bit
-  if (modifier_changes & 0x01) (modifiers & 0x01) ? Keyboard.press(KEY_LEFT_CTRL) : Keyboard.release(KEY_LEFT_CTRL);
-  if (modifier_changes & 0x02) (modifiers & 0x02) ? Keyboard.press(KEY_LEFT_SHIFT) : Keyboard.release(KEY_LEFT_SHIFT);
-  if (modifier_changes & 0x04) (modifiers & 0x04) ? Keyboard.press(KEY_LEFT_ALT) : Keyboard.release(KEY_LEFT_ALT);
-  if (modifier_changes & 0x08) (modifiers & 0x08) ? Keyboard.press(KEY_LEFT_GUI) : Keyboard.release(KEY_LEFT_GUI);
-  if (modifier_changes & 0x10) (modifiers & 0x10) ? Keyboard.press(KEY_RIGHT_CTRL) : Keyboard.release(KEY_RIGHT_CTRL);
-  if (modifier_changes & 0x20) (modifiers & 0x20) ? Keyboard.press(KEY_RIGHT_SHIFT) : Keyboard.release(KEY_RIGHT_SHIFT);
-  if (modifier_changes & 0x40) (modifiers & 0x40) ? Keyboard.press(KEY_RIGHT_ALT) : Keyboard.release(KEY_RIGHT_ALT);
-  if (modifier_changes & 0x80) (modifiers & 0x80) ? Keyboard.press(KEY_RIGHT_GUI) : Keyboard.release(KEY_RIGHT_GUI);
+  void init()
+  {}
 
-  // Handle key releases
-  for (int i = 0; i < 6; i++) {
-    if (last_keys[i] != 0) {
-      bool still_pressed = false;
-      for (int j = 0; j < 6; j++) {
-        if (keys[j] == last_keys[i]) {
-          still_pressed = true;
-          break;
-        }
-      }
-      if (!still_pressed) {
-        uint8_t usb_key = hidToUsbKey(last_keys[i]);
-        if (usb_key != 0) Keyboard.release(usb_key);
-      }
+  void handle(int key, bool state)
+  {
+    if (key >= 256) return;
+
+    bool isModifier = (key >= 0xE0 && key <= 0xE7);
+
+    if (isModifier) {
+      uint8_t usbKey = hidToUsbKey(key);
+      if (state) Keyboard.press(usbKey);
+      else Keyboard.release(usbKey);
+      return;
     }
-  }
 
-  // Handle key presses
-  for (int i = 0; i < 6; i++) {
-    if (keys[i] != 0) {
-      bool already_pressed = false;
-      for (int j = 0; j < 6; j++) {
-        if (last_keys[j] == keys[i]) {
-          already_pressed = true;
-          break;
-        }
-      }
-      if (!already_pressed) {
-        uint8_t usb_key = hidToUsbKey(keys[i]);
-        if (usb_key != 0) Keyboard.press(usb_key);
-      }
-    }
-  }
-
-  // Save current state
-  last_modifiers = modifiers;
-  memcpy(last_keys, keys, 6);
-}
-
-#if ENABLE_KEY_REMAP
-/* KEY CODE to Matrix
- *
- * HID keycode(1 byte):
- * Higher 5 bits indicates ROW and lower 3 bits COL.
- *
- *  7 6 5 4 3 2 1 0
- * +---------------+
- * |  ROW  |  COL  |
- * +---------------+
- *
- * Matrix space(16 * 16):
- *   r\c0123456789ABCDEF
- *   0 +----------------+
- *   : |                |
- *   : |                |
- *  16 +----------------+
- *
- * From: tmk_keyboard/converter/usb_usb/usb_usb.cpp
- */
-#define ROW_MASK 0xF0
-#define COL_MASK 0x0F
-#define CODE(row, col)  (((row) << 4) | (col))
-#define ROW(code)       ((uint8_t)(((code) & ROW_MASK) >> 4))
-#define COL(code)       ((uint8_t)((code) & COL_MASK))
-void forwardBLEKeyToUSB(int key, bool state) {
-  if (key >= 256) return;
-
-  keyevent_t e = (keyevent_t){
-    .key = (keypos_t){.col = COL(key), .row = ROW(key) },
-    .pressed = state,
-    .time = (uint16_t)(timer_read() | 1) /* time should not be 0 */
-  };
-
-  action_exec(e);
-}
-#else
-void forwardBLEKeyToUSB(int key, bool state) {
-  if (key >= 256) return;
-
-  bool isModifier = (key >= 0xE0 && key <= 0xE7);
-
-  if (isModifier) {
+    // Handle regular keys
     uint8_t usbKey = hidToUsbKey(key);
-    if (state) Keyboard.press(usbKey);
-    else Keyboard.release(usbKey);
-    return;
-  }
-
-  // Handle regular keys
-  uint8_t usbKey = hidToUsbKey(key);
-  if (usbKey != 0) {
-    if (state && !keyPressed[key]) {
-      keyPressed[key] = true;
-      Keyboard.press(usbKey);
-    } else if (!state && keyPressed[key]) {
-      keyPressed[key] = false;
-      Keyboard.release(usbKey);
+    if (usbKey != 0) {
+      if (state && !keyPressed[key]) {
+        keyPressed[key] = true;
+        Keyboard.press(usbKey);
+      } else if (!state && keyPressed[key]) {
+        keyPressed[key] = false;
+        Keyboard.release(usbKey);
+      }
     }
   }
-}
+
+  void clear()
+  {
+    bzero(keyPressed, sizeof(keyPressed));
+  }
+
+private:
+  bool keyPressed[256] = {0}; // Track which keys are currently pressed
+};
 #endif
 
-void celebrationBlinks(int count) {
-  pairingBlinks = count;
-  pairingBlinkTimer = millis();
-  digitalWrite(LED_BUILTIN, HIGH);
+static PairingManager g_pairingManager{};
+static KeyHandler g_keyHandler{};
+
+static void setupHIDCallbacks() {
+  // Mouse callbacks
+  g_btHID.onMouseMove([](void *cbdata, int dx, int dy, int dw) {
+    (void) cbdata;
+    if (DEBUG_MODE) {
+      Serial.printf("BLE Mouse: X:%d  Y:%d  Wheel:%d\n", dx, dy, dw);
+    }
+    Mouse.move(dx, dy);
+    if (dw != 0) Mouse.move(0, 0, dw);
+  });
+
+  g_btHID.onMouseButton([](void *cbdata, int butt, bool down) {
+    (void) cbdata;
+    if (DEBUG_MODE) {
+      Serial.printf("BLE Mouse: Button %d %s\n", butt, down ? "DOWN" : "UP");
+    }
+    if (down) {
+      if (butt == 1) Mouse.press(MOUSE_LEFT);
+      else if (butt == 2) Mouse.press(MOUSE_RIGHT);
+      else if (butt == 3) Mouse.press(MOUSE_MIDDLE);
+    } else {
+      if (butt == 1) Mouse.release(MOUSE_LEFT);
+      else if (butt == 2) Mouse.release(MOUSE_RIGHT);
+      else if (butt == 3) Mouse.release(MOUSE_MIDDLE);
+    }
+  });
+
+  // Keyboard callbacks
+  g_btHID.onKeyDown([](void *cbdata, int key) {
+    handleKey(key, true);
+  }, (void *)true);
+
+  g_btHID.onKeyUp([](void *cbdata, int key) {
+    handleKey(key, false);
+  }, (void *)false);
 }
 
-void blinkOnActivity() {
-  if (BLINK_MODE && pairingBlinks == 0 && (connection_state == CLASSIC_CONNECTED || connection_state == BLE_CONNECTED)) {
-    digitalWrite(LED_BUILTIN, LOW);  // Turn OFF briefly to show activity
-    ledBlinking = true;
-    ledOffTime = millis() + 50;      // Stay off for 50ms
+static void handleKey(int key, bool state) {
+  if (DEBUG_MODE) {
+    Serial.printf("Keyboard: %02x %s\n", key, state ? "DOWN" : "UP");
   }
+
+  if (key >= 256) return; // Bounds check
+
+  // Forward the key to USB
+  g_keyHandler.handle(key, state);
+}
+
+static const char *scanModeToString(ScanMode scanMode)
+{
+  switch (scanMode) {
+    case ScanMode::BT:
+      return "BT";
+    case ScanMode::BLE:
+      return "BLE";
+    case ScanMode::BOTH:
+    default:
+      return "BOTH";
+  }
+}
+
+static void tryConnect()
+{
+  g_state = ConnectionState::CONNECTING;
+  bool connected = g_pairingManager.connect(g_btHID, g_isBLE);
+  if (connected) {
+    g_state = ConnectionState::CONNECTED;
+    g_ledBlinker.SetInterval(0);
+    g_ledBlinker.SetLED(true);
+  } else {
+    g_ledBlinker.Blink();
+  }
+}
+
+void setup() {
+  if (ENABLE_SERIAL || DEBUG_MODE) {
+    Serial.begin(115200);
+  } else {
+    TinyHID.removeSerial();
+  }
+  delay(3000);
+
+  Serial.println("=== UNIFIED BLUETOOTH HID BRIDGE ===");
+  Serial.printf("Scan mode: %s\n", scanModeToString(SCAN_MODE));
+  Serial.println("Put your Bluetooth device in pairing mode now");
+
+  // Initialize LED
+  pinMode(LED_BUILTIN, OUTPUT);
+  digitalWrite(LED_BUILTIN, LOW);
+  Serial.println("LED initialized");
+
+  // Initialize USB HID
+  Keyboard.begin();
+  Mouse.begin();
+  Serial.println("USB HID initialized");
+
+  // Start with LED blinking to show we're alive
+  g_ledBlinker.SetLED(true);
+
+  LittleFS.begin();
+  g_pairingManager.init();
+
+  g_keyHandler.init();
+
+  Serial.println("Initializing BT/BLE stack...");
+
+  // Setup the HID key to ASCII conversion
+  g_keyStream.begin();
+  Serial.println("KeyStream initialized");
+
+  // Setup BLE callbacks
+  setupHIDCallbacks();
+  Serial.println("BT/BLE callbacks configured");
+
+  // Start BLE HID master
+  g_isBLE = (SCAN_MODE == ScanMode::BT) ? false : true;
+  g_btHID.begin(g_isBLE);
+  Serial.println("BT/BLE HID master started");
+
+  g_ledBlinker.SetInterval(250);
+  g_stateStartTime = millis();
+  tryConnect();
 }
 
 void loop() {
@@ -777,195 +530,74 @@ void loop() {
   delay(10);
 }
 
-void reconnectBle()
-{
-  if (BOOTSEL) {
-    return;
-  }
-
-  const bool connected = ble_hid.connectBLE(bleLastConnectedAddress, bleLastConnectedAddressType);
-  Serial.printf("Trying BLE reconnection (%d)...\n", (int)connected);
-}
-
 void handleStateTimeouts(unsigned long currentTime) {
-  switch (connection_state) {
-    case SCANNING_CLASSIC:
-      if (currentTime - stateStartTime > CLASSIC_SCAN_TIMEOUT) {
-        if (strcmp(SCAN_MODE, "BT_Classic") == 0) {
-          Serial.println("Classic scan timeout - BT Classic only mode, retrying...");
-          stateStartTime = currentTime;
-          scanForClassicDevices(); // Retry Classic scan
-        } else {
-          Serial.println("Classic scan timeout - falling back to BLE");
-          fallbackToBLE();
+  switch (g_state) {
+    case ConnectionState::CONNECTING: {
+      if (BOOTSEL) {
+        return;
+      }
+
+      const unsigned long timeout = g_isBLE ? BLE_SCAN_TIMEOUT : CLASSIC_SCAN_TIMEOUT;
+      if (currentTime - g_stateStartTime > timeout) {
+        if (SCAN_MODE == ScanMode::BOTH) {
+          g_isBLE = !g_isBLE;
+          g_btHID.end();
+          g_btHID.begin(g_isBLE);
+        }
+
+        tryConnect();
+      }
+      break;
+    }
+    case ConnectionState::CONNECTED: {
+      static unsigned long g_checkConnectionTime = 0;
+      if (currentTime - g_checkConnectionTime > CONNECTION_CHECK_TIMEOUT) {
+        g_checkConnectionTime = currentTime;
+        if (!g_btHID.connected()) {
+          tryConnect();
         }
       }
       break;
-
-    case SCANNING_BLE:
-      if (currentTime - stateStartTime > BLE_SCAN_TIMEOUT) {
-        if (strcmp(SCAN_MODE, "BLE") == 0) {
-          if (ble_hid.connected()) {
-            Serial.printf("=== BLE DEVICE CONNECTED ===\n");
-            Serial.printf("Ready to forward BLE input to USB.\n");
-            Serial.printf("========================\n");
-            connection_state = BLE_CONNECTED;
-            celebrationBlinks(8); // 4 blinks for BLE
-            bleCheckConnectionTime = currentTime;
-          } else {
-            Serial.println("BLE scan timeout - BLE only mode, retrying...");
-            stateStartTime = currentTime;
-            initAndScanBLE(); // Retry BLE scan
-          }
-        } else {
-          Serial.println("BLE scan timeout - restarting from Classic");
-          connection_state = BOTH_FAILED;
-          stateStartTime = currentTime;
-        }
-      }
-      break;
-
-    case BOTH_FAILED:
-      if (currentTime - stateStartTime > 5000) { // Wait 5 seconds before retry
-        Serial.println("Retrying scan sequence...");
-        connection_state = SCANNING_CLASSIC;
-        stateStartTime = currentTime;
-        initAndScanClassic();
-      }
-      break;
-
-    case BLE_CONNECTED:
-      if (currentTime - bleCheckConnectionTime > BLE_CHECK_TIMEOUT) {
-        bleCheckConnectionTime = currentTime;
-        if (!ble_hid.connected()) {
-          reconnectBle();
-        }
-      }
-      break;
+    }
   }
-}
-
-__attribute__((weak)) bool isUsbSuspended()
-{
-  //return false;
-  return TinyHID.suspended();
 }
 
 void handleLEDPatterns(unsigned long currentTime) {
   static bool prevIsSuspended = false;
-  bool currentIsSuspended = isUsbSuspended();
+  bool currentIsSuspended = TinyHID.suspended();
   if (prevIsSuspended != currentIsSuspended) {
-    digitalWrite(LED_BUILTIN, currentIsSuspended ? HIGH : LOW);
+    g_ledBlinker.SetLED(!currentIsSuspended);
     prevIsSuspended = currentIsSuspended;
     return;
   } else if (currentIsSuspended) {
-    digitalWrite(LED_BUILTIN, LOW);
+    g_ledBlinker.SetLED(false);
     return;
-  }
-
-  // Handle pairing celebration blinks first
-  if (pairingBlinks > 0) {
-    if (currentTime - pairingBlinkTimer >= 150) {
-      pairingBlinks--;
-      bool state = (pairingBlinks % 2 == 0);
-      digitalWrite(LED_BUILTIN, state);
-      pairingBlinkTimer = currentTime;
-    }
-    return;
-  }
-
-  // Handle activity blinks
-  if (ledBlinking && currentTime >= ledOffTime) {
-    digitalWrite(LED_BUILTIN, HIGH); // Turn back ON after brief off period
-    ledBlinking = false;
-    return;
-  }
-
-  // Handle state-based LED patterns
-  switch (connection_state) {
-    case SCANNING_CLASSIC:
-    case SCANNING_BLE:
-      // Slow blink while scanning (1 second cycle)
-      if (currentTime - ledTimer >= 1000) {
-        ledState = !ledState;
-        digitalWrite(LED_BUILTIN, ledState);
-        ledTimer = currentTime;
-      }
-      break;
-
-    case CLASSIC_CONNECTING:
-      // Fast blink while connecting - tells user to press a key
-      if (currentTime - ledTimer >= 250) {
-        ledState = !ledState;
-        digitalWrite(LED_BUILTIN, ledState);
-        ledTimer = currentTime;
-      }
-      break;
-
-    case CLASSIC_CONNECTED:
-    case BLE_CONNECTED:
-      // Solid ON while connected (unless doing activity blinks)
-      if (!ledBlinking) {
-        digitalWrite(LED_BUILTIN, HIGH);
-      }
-      break;
-
-    case BOTH_FAILED:
-    case DISCONNECTED:
-      // Very slow pulse when failed/disconnected (2 second cycle)
-      if (currentTime - ledTimer >= 2000) {
-        ledState = !ledState;
-        digitalWrite(LED_BUILTIN, ledState);
-        ledTimer = currentTime;
-      }
-      break;
   }
 }
 
 void handleBootselButton() {
-  if (BOOTSEL) {
-    while (BOOTSEL) delay(1);
-
-    Serial.println("\nBOOTSEL pressed - restarting scan sequence");
-
-    bzero(bleLastConnectedAddress, sizeof(bleLastConnectedAddress));
-
-    // Clean up current connections
-    if (connection_state == CLASSIC_CONNECTED) {
-      if (hid_control_cid) l2cap_disconnect(hid_control_cid);
-      if (hid_interrupt_cid) l2cap_disconnect(hid_interrupt_cid);
-    } else if (connection_state == BLE_CONNECTED) {
-      ble_hid.disconnect();
-      ble_hid.clearPairing();
-    }
-
-    // Reset all state
-    Keyboard.releaseAll();
-    Mouse.release(MOUSE_LEFT | MOUSE_RIGHT | MOUSE_MIDDLE);
-
-    for (int i = 0; i < 256; i++) keyPressed[i] = false;
-    memset(last_keys, 0, 6);
-    last_modifiers = 0;
-
-    target_keyboard_found = false;
-    hid_control_cid = 0;
-    hid_interrupt_cid = 0;
-    pairingBlinks = 0;
-    ledBlinking = false;
-
-    // Restart from appropriate scan mode
-    if (strcmp(SCAN_MODE, "BT_Classic") == 0) {
-      connection_state = SCANNING_CLASSIC;
-      Serial.println("Restarting BT Classic scan...");
-      initAndScanClassic();
-    } else if (strcmp(SCAN_MODE, "BLE") == 0) {
-      connection_state = SCANNING_BLE;
-      Serial.println("Restarting BLE scan...");
-      initAndScanBLE();
-    } else {
-      connection_state = SCANNING_CLASSIC;
-      Serial.println("Restarting unified scan...");
-      initAndScanClassic();
-    }
+  if (!BOOTSEL) {
+    return;
   }
+
+  while (BOOTSEL) delay(1);
+
+  Serial.println("\nBOOTSEL pressed - restarting scan sequence");
+
+  g_pairingManager.clear();
+
+  // Clean up current connections
+  if (g_state == ConnectionState::CONNECTED) {
+    g_btHID.disconnect();
+    g_btHID.clearPairing();
+    g_state = ConnectionState::INIT;
+  }
+
+  // Reset all state
+  Keyboard.releaseAll();
+  Mouse.release(MOUSE_LEFT | MOUSE_RIGHT | MOUSE_MIDDLE);
+
+  g_keyHandler.clear();
+
+  tryConnect();
 }
