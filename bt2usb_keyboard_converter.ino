@@ -14,9 +14,9 @@
 #define ENABLE_SERIAL false  // Set to false to avoid possible usb/com port conflict
 #define ENABLE_KEY_REMAP 1
 
-#include <BluetoothHIDMaster.h>
 #include <LittleFS.h>
 #include "my_hid_device.h"
+#include "my_bluetooth_hid_master.h"
 #if ENABLE_KEY_REMAP
 #include "host.h"
 #include "timer.h"
@@ -39,8 +39,8 @@ enum class ConnectionState {
 const ScanMode SCAN_MODE = ScanMode::BLE;
 
 static ConnectionState g_state = ConnectionState::INIT;
-static BluetoothHIDMaster g_btHID;
-static HIDKeyStream g_keyStream;
+static MyBluetoothHIDMaster g_btHID;
+static MyHIDKeyStream g_keyStream;
 static bool g_isBLE = false;
 
 // Timing management
@@ -92,6 +92,17 @@ static const char *macToString(const uint8_t *addr, uint8_t addrType)
   return mac;
 }
 
+static inline uint8_t getDefaultLayer(const char* name)
+{
+#if ENABLE_KEY_REMAP
+  if (strncmp(name, "HHKB", 4u) == 0) {
+    return 1;
+  }
+#endif
+
+  return 0;
+}
+
 static inline bool isValidAddress(uint8_t (&address)[6])
 {
   uint8_t value = 0;
@@ -109,6 +120,7 @@ class PairingManager {
     char hdr[16];     // The header marker so we know this is our data
     uint8_t addr[6];  // MAC of the peer we last connected to
     uint8_t addrType; // Type of address (normal or randomized) of the last peer
+    uint8_t defaultLayer; // Default layer in TMK
   };
 
 public:
@@ -140,11 +152,13 @@ public:
       Serial.printf("No previous paired device found in %s\n", PAIRING_INFO_PATH);
       bzero(m_lastAddr, 6);
       m_lastAddrType = 0;
+      m_defaultLayer = 0;
     } else {
       // Our baby, copy it to local storage
       Serial.printf("Previoudly paired device found: %s\n", macToString(data.addr, data.addrType));
       memcpy(m_lastAddr, data.addr, sizeof(m_lastAddr));
       m_lastAddrType = data.addrType;
+      m_defaultLayer = data.defaultLayer;
     }
   }
 
@@ -153,7 +167,7 @@ public:
     bzero(m_lastAddr, sizeof(m_lastAddr));
   }
 
-  bool connect(BluetoothHIDMaster &hid, bool ble)
+  bool connect(MyBluetoothHIDMaster &hid, bool ble)
   {
     bool connected = false;
     int type = 0;
@@ -176,10 +190,15 @@ public:
 
       memcpy(m_lastAddr, g_btHID.lastConnectedAddress(), sizeof(m_lastAddr));
       m_lastAddrType = g_btHID.lastConnectedAddressType();
+      m_defaultLayer = getDefaultLayer(g_btHID.lastConnectedName());
       if (isValidAddress(m_lastAddr)) {
         savePairingInfo();
       }
     }
+
+#if ENABLE_KEY_REMAP
+    default_layer_set(static_cast<uint32_t>(1) << m_defaultLayer);
+#endif
 
     Serial.printf("%s connection initiated (%d, %d)\n", ble ? "BLE" : "BT", type, (int)connected);
     return connected;
@@ -192,6 +211,7 @@ private:
     memcpy(data.hdr, DATAHEADER, sizeof(data.hdr));
     memcpy(data.addr, m_lastAddr, sizeof(data.addr));
     data.addrType = m_lastAddrType;
+    data.defaultLayer = m_defaultLayer;
 
     File f = LittleFS.open(PAIRING_INFO_PATH, "w");
     if (!f) {
@@ -212,6 +232,7 @@ private:
 
   uint8_t m_lastAddr[6] = {};
   uint8_t m_lastAddrType = 0;
+  uint8_t m_defaultLayer = 0;
 
   // From libraries/BluetoothHIDMaster/examples/KeyboardPianoBLE/KeyboardPianoBLE.ino
   static constexpr const char *DATAHEADER = "Last BLE Address"; // exactly 16 chars + \0

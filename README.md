@@ -17,6 +17,7 @@ Use a Raspberry Pi Pico W or Pico 2W to bridge a wireless keyboard to a USB host
 # Support keyboards
 
 - Realforce R4
+- HHKB Pro Hybrid Type-S
 
 # Reference
 
