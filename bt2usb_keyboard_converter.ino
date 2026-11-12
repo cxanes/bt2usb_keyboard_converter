@@ -95,7 +95,9 @@ static const char *macToString(const uint8_t *addr, uint8_t addrType)
 static inline uint8_t getDefaultLayer(const char* name)
 {
 #if ENABLE_KEY_REMAP
+    // HHKB uses its own customized key mapping
     if (strncmp(name, "HHKB", 4u) == 0) {
+        // select plain layer (no key remapping)
         return 1;
     }
 #endif
