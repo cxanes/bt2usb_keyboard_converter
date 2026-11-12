@@ -141,11 +141,11 @@ bool TinyHIDDevice::ready() {
 
 // Wait until the HID endpoint can send; issue remote wakeup instead when suspended
 static bool prepareSend(Adafruit_USBD_HID &hid) {
+  if (!TinyUSBDevice.mounted()) return false;
+
   if (TinyUSBDevice.suspended()) {
     TinyUSBDevice.remoteWakeup();
-    return false;
   }
-  if (!TinyUSBDevice.mounted()) return false;
 
   uint32_t start = millis();
   while (!hid.ready()) {

@@ -47,7 +47,8 @@ static bool g_isBLE = false;
 unsigned long g_stateStartTime = 0;
 const unsigned long CLASSIC_SCAN_TIMEOUT = 10000;
 const unsigned long BLE_SCAN_TIMEOUT = 15000;
-const unsigned long CONNECTION_CHECK_TIMEOUT = 5000;
+const unsigned long CONNECTION_CHECK_TIMEOUT_FAST = 2000;
+const unsigned long CONNECTION_CHECK_TIMEOUT_SLOW = 5000;
 
 class LEDBlinker {
 public:
@@ -171,23 +172,22 @@ public:
 
     bool connect(MyBluetoothHIDMaster &hid, bool ble)
     {
-        bool connected = false;
         int type = 0;
         if (isValidAddress(m_lastAddr)) {
             type = 0;
             Serial.printf("Connect paired device directly: %s\n", macToString(m_lastAddr, m_lastAddrType));
             if (ble) {
-                connected = g_btHID.connectBLE(m_lastAddr, m_lastAddrType, ledBlink);
+                g_btHID.connectBLE(m_lastAddr, m_lastAddrType, ledBlink);
             } else {
-                connected = g_btHID.connect(m_lastAddr);
+                g_btHID.connect(m_lastAddr);
             }
         } else {
             type = 1;
             Serial.println("Waiting for device...");
             if (ble) {
-                connected = g_btHID.connectBLE(ledBlink);
+                g_btHID.connectBLE(ledBlink);
             } else {
-                connected = g_btHID.connectAny();
+                g_btHID.connectAny();
             }
 
             memcpy(m_lastAddr, g_btHID.lastConnectedAddress(), sizeof(m_lastAddr));
@@ -198,8 +198,13 @@ public:
             }
         }
 
+        delay(10);
+        bool connected = g_btHID.connected();
+
 #if ENABLE_KEY_REMAP
-        default_layer_set(static_cast<uint32_t>(1) << m_defaultLayer);
+        if (connected) {
+            default_layer_set(static_cast<uint32_t>(1) << m_defaultLayer);
+        }
 #endif
 
         Serial.printf("%s connection initiated (%d, %d)\n", ble ? "BLE" : "BT", type, (int)connected);
@@ -477,6 +482,8 @@ static const char *scanModeToString(ScanMode scanMode)
     }
 }
 
+static unsigned long g_checkConnectionTime = 0;
+
 static void tryConnect()
 {
     g_state = ConnectionState::CONNECTING;
@@ -485,9 +492,19 @@ static void tryConnect()
         g_state = ConnectionState::CONNECTED;
         g_ledBlinker.SetInterval(0);
         g_ledBlinker.SetLED(true);
+
+        uint32_t retryCount = 10;
+        while (TinyHID.suspended() && retryCount != 0) {
+            TinyHID.remoteWakeup();
+            Keyboard.sendSystemReport(SYSTEM_WAKE_UP);
+            Keyboard.sendSystemReport(0);
+            --retryCount;
+            delay(10);
+        }
     } else {
         g_ledBlinker.Blink();
     }
+    g_checkConnectionTime = millis();
 }
 
 void setup()
@@ -562,12 +579,15 @@ void handleStateTimeouts(unsigned long currentTime)
     switch (g_state) {
         case ConnectionState::CONNECTING: {
             if (BOOTSEL) {
+                g_stateStartTime = millis();
                 return;
             }
 
             const unsigned long timeout = g_isBLE ? BLE_SCAN_TIMEOUT : CLASSIC_SCAN_TIMEOUT;
-            if (currentTime - g_stateStartTime > timeout) {
-                if (SCAN_MODE == ScanMode::BOTH) {
+            if (currentTime - g_checkConnectionTime > CONNECTION_CHECK_TIMEOUT_FAST) {
+                g_checkConnectionTime = millis();
+                if (SCAN_MODE == ScanMode::BOTH && (currentTime - g_stateStartTime > timeout)) {
+                    g_stateStartTime = millis();
                     g_isBLE = !g_isBLE;
                     g_btHID.end();
                     g_btHID.begin(g_isBLE);
@@ -578,9 +598,8 @@ void handleStateTimeouts(unsigned long currentTime)
             break;
         }
         case ConnectionState::CONNECTED: {
-            static unsigned long g_checkConnectionTime = 0;
-            if (currentTime - g_checkConnectionTime > CONNECTION_CHECK_TIMEOUT) {
-                g_checkConnectionTime = currentTime;
+            if (currentTime - g_checkConnectionTime > CONNECTION_CHECK_TIMEOUT_SLOW) {
+                g_checkConnectionTime = millis();
                 if (!g_btHID.connected()) {
                     tryConnect();
                 }
@@ -629,5 +648,6 @@ void handleBootselButton()
 
     g_keyHandler.clear();
 
+    g_ledBlinker.SetInterval(250);
     tryConnect();
 }
